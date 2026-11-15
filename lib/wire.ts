@@ -42,18 +42,14 @@ const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
 
 /** GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape. */
 export function openAIModelList(models: readonly ServedModel[]): Json {
-  return {
-    object: 'list',
-    data: models.map((m) => ({ id: m.id, object: 'model', created: FIXED_OPENAI_CREATED, owned_by: m.provider })),
-  };
+  const data = models.map((m) => ({ id: m.id, object: 'model', created: FIXED_OPENAI_CREATED, owned_by: m.provider }));
+  return { object: 'list', data };
 }
 
 /** GET /v1/models on an Anthropic-shaped request (an x-api-key header): Anthropic's model list shape. */
 export function anthropicModelList(models: readonly ServedModel[]): Json {
-  return {
-    data: models.map((m) => ({ type: 'model', id: m.id, display_name: m.display_name, created_at: FIXED_ANTHROPIC_CREATED_AT })),
-    has_more: false,
-  };
+  const data = models.map((m) => ({ type: 'model', id: m.id, display_name: m.display_name, created_at: FIXED_ANTHROPIC_CREATED_AT }));
+  return { data, has_more: false };
 }
 
 /** An error in Anthropic's shape (the Messages API's error envelope). */
