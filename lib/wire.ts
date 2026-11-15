@@ -39,7 +39,6 @@ export function servedModelSummary(models: readonly ServedModel[]): string {
 const FIXED_OPENAI_CREATED = 1767225600;
 /** A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock. */
 const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
-
 /** GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape. */
 export function openAIModelList(models: readonly ServedModel[]): Json {
   const data = models.map((m) => ({ id: m.id, object: 'model', created: FIXED_OPENAI_CREATED, owned_by: m.provider }));
@@ -85,29 +84,28 @@ function partOf(block: Json): Json | null {
   if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
   return null;
 }
-
 /** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
     const text = textOf(content);
-    return text !== '' ? text : JSON.stringify(content);
+    if (text !== '') return text;
+    return JSON.stringify(content);
   }
-  return content === undefined ? '' : JSON.stringify(content);
+  if (content === undefined) return '';
+  return JSON.stringify(content);
 }
 
 /** A tool call's arguments as an object: the provider's JSON string, or {} when it is not one. */
 function argumentsOf(value: unknown): Json {
   if (isRecord(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isRecord(parsed)) return parsed;
-    } catch {
-      // Not JSON: an empty input.
-    }
+  if (typeof value !== 'string' || value.trim() === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
   }
-  return {};
 }
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
