@@ -321,6 +321,29 @@ export function ratingOfModel(ratings: RatingsFile | null, providerId: string, m
 }
 
 /**
+ * The free models of one provider that meet a request's requirements, best rating first. This is
+ * the ranking the router uses: it keeps the quality table's order (rating_milli descending) and
+ * drops every model that is paid or that lacks something the request needs, so the first entry is
+ * the best legal pick on that provider.
+ */
+export function rankedFreeModels(ratings: RatingsFile | null, probe: Probe, requires: Requirement): { model: ProbedModel; rating: number }[] {
+  const out: { model: ProbedModel; rating: number }[] = [];
+  for (const model of probe.models) {
+    const row = ratingOfModel(ratings, probe.provider.id, model.id);
+    if (!modelFree(model, row)) continue;
+    if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+    out.push({ model, rating: row?.rating_milli ?? 0 });
+  }
+  out.sort((a, b) => b.rating - a.rating || (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0));
+  return out;
+}
+
+/** The providers in a catalog that answered, in the directory's order. */
+export function answeredProviders(probes: readonly Probe[]): Probe[] {
+  return probes.filter((p) => p.ok);
+}
+
+/**
  * Whether a model is free: the quality table's row where it has one (it is the sealed truth), the
  * listing's own word where it does not, and paid when neither says. A paid model is never routed.
  */
