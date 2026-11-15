@@ -415,17 +415,19 @@ function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
   const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
+  const isGemini = provider.wire === 'gemini';
+  const url = isGemini ? `${base}/v1beta/models` : `${base}/v1/models`;
   const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
   if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  let res: Response;
   try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
   }
+  if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
+  const body: unknown = await res.json();
+  return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
 }
 
 /**
