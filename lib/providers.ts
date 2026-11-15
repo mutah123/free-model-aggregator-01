@@ -436,6 +436,9 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
  * fresh pod on the k8s layout), and the catalog is part of the state export a replay must reproduce byte
  * for byte. The scorer compares a reported base_url by its path suffix, so the path passes exactly as the
  * joined URL does; the joined URL reaches a provider, the path names it.
+ *
+ * Models are deduplicated by id (a listing that repeats one keeps its first spelling) and sorted by id,
+ * so the catalog is deterministic no matter what order a provider listed them in.
  */
 export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
   const providers: CatalogProvider[] = [];
@@ -443,11 +446,13 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    const sorted = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const model of sorted) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+      const context = row?.context_length ?? model.context_length ?? null;
+      models.push({ id: model.id, free: modelFree(model, row), context_length: context });
     }
     providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
   }
