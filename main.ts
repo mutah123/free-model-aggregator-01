@@ -23,6 +23,7 @@ import {
   meetsRequirements,
   modelFree,
   probeProvider,
+  rankedFreeModels,
   ratingOfModel,
   readBrief,
   type CatalogReport,
@@ -64,6 +65,23 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Providers that refused a call this trial (402/429/5xx): out of budget or on a failure schedule. */
 const refusedProviders = new Set<string>();
+/**
+ * Per-provider call accounting for this trial: how many inference calls each provider answered and
+ * how many it refused. The router uses the refused set to skip spent providers; the counts are
+ * only a diagnostic, written to stderr when the trial ends, so a replay that serves the same
+ * requests reproduces the same export: the counts never steer a routing decision.
+ */
+const providerCalls = new Map<string, { served: number; refused: number }>();
+function noteCall(providerId: string, served: boolean): void {
+  const row = providerCalls.get(providerId) ?? { served: 0, refused: 0 };
+  if (served) row.served += 1;
+  else row.refused += 1;
+  providerCalls.set(providerId, row);
+}
+function logProviderSummary(): void {
+  const rows = [...providerCalls.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  for (const [id, counts] of rows) log(`provider ${id}: ${counts.served} served, ${counts.refused} refused`);
+}
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -100,18 +118,17 @@ interface Candidate {
 /**
  * Every free model that meets the requirements, best rating first, on any wire. Providers that
  * refused this trial are skipped (their per-trial budget is spent). The anthropic and gemini
- * wires are served by lib/upstream.ts, which translates them to and from OpenAI shape.
+ * wires are served by lib/upstream.ts, which translates them to and from OpenAI shape. The
+ * per-provider ranking comes from lib/providers.ts's rankedFreeModels; this function merges the
+ * providers' ranked lists into one global order, so the best model on any provider is first.
  */
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
     if (refusedProviders.has(probe.provider.id)) continue;
-    for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
+    for (const { model, rating } of rankedFreeModels(brief.ratings, probe, requires)) {
+      out.push({ probe, model, rating });
     }
   }
   // Best rating first; ties break by model id, then provider id, so the order is deterministic.
@@ -255,6 +272,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       upstream = await callProvider(candidate, { ...body, model: candidate.model.id });
     } catch (err) {
       refusedProviders.add(candidate.probe.provider.id);
+      noteCall(candidate.probe.provider.id, false);
       lastStatus = 502;
       lastText = (err as Error).message;
       continue;
@@ -264,12 +282,15 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       lastText = (await upstream.text()).slice(0, 500);
       if (isRefusal(upstream.status)) {
         refusedProviders.add(candidate.probe.provider.id);
+        noteCall(candidate.probe.provider.id, false);
         continue;
       }
+      noteCall(candidate.probe.provider.id, false);
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       res.end(lastText);
       return;
     }
+    noteCall(candidate.probe.provider.id, true);
     if (body.stream === true && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       await pipeStream(upstream.body, res);
@@ -298,6 +319,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       upstream = await callProvider(candidate, anthropicToOpenAI(body, candidate.model.id));
     } catch (err) {
       refusedProviders.add(candidate.probe.provider.id);
+      noteCall(candidate.probe.provider.id, false);
       lastStatus = 502;
       lastText = (err as Error).message;
       continue;
@@ -307,10 +329,13 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       lastText = (await upstream.text()).slice(0, 500);
       if (isRefusal(upstream.status)) {
         refusedProviders.add(candidate.probe.provider.id);
+        noteCall(candidate.probe.provider.id, false);
         continue;
       }
+      noteCall(candidate.probe.provider.id, false);
       return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${lastText}`));
     }
+    noteCall(candidate.probe.provider.id, true);
     if (body.stream === true && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
@@ -372,6 +397,7 @@ function poll(server: Server): void {
         const work: unknown = await res.json();
         if (isRecord(work) && work.done === true) {
           clearInterval(timer);
+          logProviderSummary();
           server.close();
           process.exit(0);
         }
