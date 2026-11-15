@@ -29,6 +29,12 @@ export interface ServedModel {
   display_name: string;
 }
 
+/** A short, stable summary of the models an entry serves: `provider/model` pairs, sorted, for logs. */
+export function servedModelSummary(models: readonly ServedModel[]): string {
+  const ids = models.map((m) => `${m.provider}/${m.id}`).sort();
+  return ids.join(', ');
+}
+
 /** A fixed epoch second for every listed model's `created`: nothing in the reply reads the clock. */
 const FIXED_OPENAI_CREATED = 1767225600;
 /** A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock. */
