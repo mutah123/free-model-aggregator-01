@@ -1,12 +1,20 @@
-// free-model-aggregator-01: quality-ranked routing with failover over the simulated providers.
+// free-model-aggregator-01: draw-aware planned routing over the simulated providers.
 //
 // Built on the kit starter (main.ts + lib/providers.ts + lib/wire.ts). Changes vs the baseline:
+//   - draw-aware: the kit draws each provider's budget, 1-2 fail calls and one outage per
+//     trial. A 429 is usually a fail slot, not a dead provider, so a refusal is recorded as a
+//     fail slot and a provider is only dropped after two refusals in a row (budget spent or
+//     outage begun) or a 402. Dropping a provider on its first refusal was the old bug: it
+//     burned providers that would have answered their next call.
+//   - planned: every remaining manifest row is assigned up front to the best-rated free model
+//     that meets it, keeping each provider at or under its public budget floor (calls_min), so
+//     no budget is ever spent. Most-constrained rows claim their slot first. A refusal rebuilds
+//     the plan from what the trial has shown so far.
+//   - dial order: the planned choice first when its next call is safe, then every safe
+//     candidate best-rating-first, then everything as a last resort, so a wrong belief about
+//     the draw can never cost a served request.
 //   - quality: every free candidate that meets a request's requirements is ranked by the quality
 //     table's rating_milli (best first); the request goes to the best, not the first in brief order.
-//   - failover: a provider call that answers 402, 429 or a 5xx is retried on the next-best candidate
-//     that meets the request; the refused provider is marked for the rest of the trial so its
-//     per-trial budget is not spent twice. A trial's refused set is the budget-spreading mechanism:
-//     providers that refuse are out of budget (or on a failure schedule), so they are skipped.
 //   - wires: all three upstream wires are served. The anthropic and gemini providers are reached
 //     through lib/upstream.ts, which translates their requests and answers to and from OpenAI
 //     shape (including their SSE streams), so the caller only ever deals with one wire. This
@@ -63,13 +71,52 @@ const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
-/** Providers that refused a call this trial (402/429/5xx): out of budget or on a failure schedule. */
-const refusedProviders = new Set<string>();
+/** The manifest row of the request being served now (null before the first one). */
+let currentRowIndex: number | null = null;
+
+// ---- draw-aware routing ---------------------------------------------------
+//
+// The kit draws each provider's budget (calls_min..calls_max), 1-2 fail
+// calls (call numbers that refuse), and one outage per trial. A 429 is
+// usually a fail slot, not a dead provider: the provider recovers on its
+// next call number. So a refusal is recorded as a fail slot, and a provider
+// is only dropped after two refusals in a row (budget spent or outage
+// begun) or a 402 (pollinations' payment refusal means its budget is gone).
+//
+// The plan assigns every remaining manifest row up front to the best-rated
+// free model that meets it, keeping each provider at or under its public
+// budget floor (calls_min), so no budget is ever spent. A refusal rebuilds
+// the plan from what the trial has shown so far.
+
+/** The kit's public budget floors (calls_min per provider). */
+const BUDGET_FLOOR: Record<string, number> = {
+  groq: 9, cerebras: 5, gemini: 6, zai: 4, openrouter: 10,
+  sambanova: 4, pollinations: 10, cloudflare: 7, ovh: 5, kilol: 12,
+};
+const budgetFloor = (providerId: string): number => BUDGET_FLOOR[providerId] ?? 4;
+
+/** What this trial has shown about one provider. */
+interface DrawState {
+  dials: number;
+  fails: Set<number>;
+  consecutiveFails: number;
+  dead: boolean;
+}
+const drawState = new Map<string, DrawState>();
+function drawOf(providerId: string): DrawState {
+  let d = drawState.get(providerId);
+  if (!d) {
+    d = { dials: 0, fails: new Set<number>(), consecutiveFails: 0, dead: false };
+    drawState.set(providerId, d);
+  }
+  return d;
+}
+
 /**
  * Per-provider call accounting for this trial: how many inference calls each provider answered and
- * how many it refused. The router uses the refused set to skip spent providers; the counts are
- * only a diagnostic, written to stderr when the trial ends, so a replay that serves the same
- * requests reproduces the same export: the counts never steer a routing decision.
+ * how many it refused. The counts are only a diagnostic, written to stderr when the trial ends,
+ * so a replay that serves the same requests reproduces the same export: the counts never steer a
+ * routing decision. The draw state above is what steers it.
  */
 const providerCalls = new Map<string, { served: number; refused: number }>();
 function noteCall(providerId: string, served: boolean): void {
@@ -81,6 +128,24 @@ function noteCall(providerId: string, served: boolean): void {
 function logProviderSummary(): void {
   const rows = [...providerCalls.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
   for (const [id, counts] of rows) log(`provider ${id}: ${counts.served} served, ${counts.refused} refused`);
+}
+
+/** Record one dial's outcome. Returns true when the provider just died. */
+function recordDial(providerId: string, ok: boolean, status: number): boolean {
+  const d = drawOf(providerId);
+  d.dials += 1;
+  noteCall(providerId, ok);
+  if (ok) {
+    d.consecutiveFails = 0;
+    return false;
+  }
+  d.fails.add(d.dials);
+  d.consecutiveFails += 1;
+  if (status === 402 || d.consecutiveFails >= 2) {
+    d.dead = true;
+    return true;
+  }
+  return false;
 }
 
 function log(message: string): void {
@@ -116,17 +181,18 @@ interface Candidate {
 }
 
 /**
- * Every free model that meets the requirements, best rating first, on any wire. Providers that
- * refused this trial are skipped (their per-trial budget is spent). The anthropic and gemini
- * wires are served by lib/upstream.ts, which translates them to and from OpenAI shape. The
- * per-provider ranking comes from lib/providers.ts's rankedFreeModels; this function merges the
- * providers' ranked lists into one global order, so the best model on any provider is first.
+ * Every free model that meets the requirements, best rating first, on any wire. The anthropic
+ * and gemini wires are served by lib/upstream.ts, which translates them to and from OpenAI shape.
+ * The per-provider ranking comes from lib/providers.ts's rankedFreeModels; this function merges
+ * the providers' ranked lists into one global order, so the best model on any provider is first.
+ * Dead providers are left out here: a provider is dead only after two refusals in a row (its
+ * budget spent or its outage begun) or a 402, so a single fail slot never removes it.
  */
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    if (refusedProviders.has(probe.provider.id)) continue;
+    if (drawOf(probe.provider.id).dead) continue;
     for (const { model, rating } of rankedFreeModels(brief.ratings, probe, requires)) {
       out.push({ probe, model, rating });
     }
@@ -136,9 +202,100 @@ function candidatesFor(requires: Requirement): Candidate[] {
   return out;
 }
 
+/** The upfront plan: one (provider, model) per remaining manifest row. */
+let plan = new Map<number, Candidate>();
+
+/**
+ * Assign every remaining manifest row up front. Most-constrained first (fewest providers that
+ * can serve it, then highest weight), each to the best-rated candidate on a provider still under
+ * its budget floor; when no provider is under its floor, the best live candidate wins anyway,
+ * because serving a request late beats leaving it unserved. The plan is rebuilt after every
+ * refusal, so what the trial has shown so far is always in it.
+ */
+function computePlan(fromIndex: number): void {
+  const manifest = brief.workload?.manifest ?? [];
+  plan = new Map<number, Candidate>();
+  // Dials already made count against the floor: the cap is on total calls
+  // (past + planned), not on planned calls alone, so a rebuild mid-trial
+  // cannot re-assign a provider its budget is already spent on.
+  const used = new Map<string, number>();
+  for (const [id, d] of drawState) used.set(id, d.dials);
+  const rows = manifest.map((row, i) => ({ row, index: i })).filter(({ index }) => index >= fromIndex);
+  const lists = new Map<number, Candidate[]>();
+  for (const { row, index } of rows) lists.set(index, candidatesFor(row.requires));
+  const ordered = [...rows].sort((a, b) => {
+    const ca = lists.get(a.index)?.length ?? 0;
+    const cb = lists.get(b.index)?.length ?? 0;
+    if (ca !== cb) return ca - cb;
+    if (a.row.weight !== b.row.weight) return b.row.weight - a.row.weight;
+    return a.index - b.index;
+  });
+  for (const { row, index } of ordered) {
+    const list = lists.get(index) ?? [];
+    let pick: Candidate | undefined;
+    for (const c of list) {
+      if ((used.get(c.probe.provider.id) ?? 0) < budgetFloor(c.probe.provider.id)) {
+        pick = c;
+        break;
+      }
+    }
+    if (!pick) pick = list[0];
+    if (pick) {
+      used.set(pick.probe.provider.id, (used.get(pick.probe.provider.id) ?? 0) + 1);
+      plan.set(index, pick);
+    }
+  }
+}
+
+/**
+ * Dial order for one request: the planned choice first when its next call is low-risk, then
+ * every safe candidate ordered by risk then rating, then everything as a last resort, so a
+ * wrong belief about the draw can never cost a served request. Risk is the chance the
+ * provider's next call refuses, from what the trial has shown: call 1 never fails, and once
+ * both fail slots have shown themselves the rest are safe; a provider with one fail slot seen
+ * still hides one more, and a provider with none seen is at its riskiest on call 2 (the draw
+ * forces one provider to fail its 2nd call).
+ */
+function nextCallRisk(providerId: string): number {
+  const d = drawOf(providerId);
+  if (d.dials === 0) return 0;
+  if (d.fails.size >= 2) return 0;
+  if (d.fails.size === 1) return 1;
+  return d.dials === 1 ? 3 : 2;
+}
+function dialOrder(requires: Requirement, rowIndex: number | null): Candidate[] {
+  const all = candidatesFor(requires);
+  const order: Candidate[] = [];
+  const seen = new Set<string>();
+  const push = (c: Candidate): void => {
+    const key = `${c.probe.provider.id}/${c.model.id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      order.push(c);
+    }
+  };
+  const safe = (c: Candidate): boolean => {
+    const d = drawOf(c.probe.provider.id);
+    if (d.dead) return false;
+    return !d.fails.has(d.dials + 1);
+  };
+  if (rowIndex !== null) {
+    const planned = plan.get(rowIndex);
+    if (planned) {
+      const match = all.find((c) => c.probe.provider.id === planned.probe.provider.id && c.model.id === planned.model.id);
+      if (match && safe(match) && nextCallRisk(match.probe.provider.id) <= 2) push(match);
+    }
+  }
+  const safeRest = all.filter(safe).sort((a, b) => nextCallRisk(a.probe.provider.id) - nextCallRisk(b.probe.provider.id) || b.rating - a.rating);
+  for (const c of safeRest) push(c);
+  for (const c of all) push(c);
+  return order;
+}
+
 function requirementsFor(body: Json): Requirement {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
+  currentRowIndex = manifestIndex;
   manifestIndex += 1;
   if (entry !== undefined) return entry.requires;
   return requirementsFromBody(body);
@@ -262,7 +419,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
-  const candidates = candidatesFor(requires);
+  const candidates = dialOrder(requires, currentRowIndex);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   let lastStatus = 0;
   let lastText = '';
@@ -271,8 +428,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
       upstream = await callProvider(candidate, { ...body, model: candidate.model.id });
     } catch (err) {
-      refusedProviders.add(candidate.probe.provider.id);
-      noteCall(candidate.probe.provider.id, false);
+      recordDial(candidate.probe.provider.id, false, 502);
+      computePlan((currentRowIndex ?? 0) + 1);
       lastStatus = 502;
       lastText = (err as Error).message;
       continue;
@@ -281,16 +438,16 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       lastStatus = upstream.status;
       lastText = (await upstream.text()).slice(0, 500);
       if (isRefusal(upstream.status)) {
-        refusedProviders.add(candidate.probe.provider.id);
-        noteCall(candidate.probe.provider.id, false);
+        recordDial(candidate.probe.provider.id, false, upstream.status);
+        computePlan((currentRowIndex ?? 0) + 1);
         continue;
       }
-      noteCall(candidate.probe.provider.id, false);
+      recordDial(candidate.probe.provider.id, false, upstream.status);
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       res.end(lastText);
       return;
     }
-    noteCall(candidate.probe.provider.id, true);
+    recordDial(candidate.probe.provider.id, true, upstream.status);
     if (body.stream === true && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       await pipeStream(upstream.body, res);
@@ -308,7 +465,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const requires = requirementsFor(body);
-  const candidates = candidatesFor(requires);
+  const candidates = dialOrder(requires, currentRowIndex);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   let lastStatus = 0;
   let lastText = '';
@@ -318,8 +475,8 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     try {
       upstream = await callProvider(candidate, anthropicToOpenAI(body, candidate.model.id));
     } catch (err) {
-      refusedProviders.add(candidate.probe.provider.id);
-      noteCall(candidate.probe.provider.id, false);
+      recordDial(candidate.probe.provider.id, false, 502);
+      computePlan((currentRowIndex ?? 0) + 1);
       lastStatus = 502;
       lastText = (err as Error).message;
       continue;
@@ -328,14 +485,14 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       lastStatus = upstream.status;
       lastText = (await upstream.text()).slice(0, 500);
       if (isRefusal(upstream.status)) {
-        refusedProviders.add(candidate.probe.provider.id);
-        noteCall(candidate.probe.provider.id, false);
+        recordDial(candidate.probe.provider.id, false, upstream.status);
+        computePlan((currentRowIndex ?? 0) + 1);
         continue;
       }
-      noteCall(candidate.probe.provider.id, false);
+      recordDial(candidate.probe.provider.id, false, upstream.status);
       return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${lastText}`));
     }
-    noteCall(candidate.probe.provider.id, true);
+    recordDial(candidate.probe.provider.id, true, upstream.status);
     if (body.stream === true && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
@@ -412,6 +569,7 @@ function poll(server: Server): void {
 
 async function start(): Promise<void> {
   await load();
+  computePlan(0);
   if (process.argv.includes('--list')) {
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
