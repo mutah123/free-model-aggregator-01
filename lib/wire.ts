@@ -110,10 +110,22 @@ function argumentsOf(value: unknown): Json {
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
 export function stopReasonOf(finish: unknown): string {
-  if (finish === 'length') return 'max_tokens';
-  if (finish === 'tool_calls' || finish === 'function_call') return 'tool_use';
-  if (finish === 'content_filter') return 'refusal';
-  return 'end_turn';
+  switch (finish) {
+    case 'length':
+      return 'max_tokens';
+    case 'tool_calls':
+    case 'function_call':
+      return 'tool_use';
+    case 'content_filter':
+      return 'refusal';
+    default:
+      return 'end_turn';
+  }
+}
+
+function numberOrZero(value: unknown): number {
+  if (typeof value !== 'number') return 0;
+  return Number.isFinite(value) ? value : 0;
 }
 
 /**
@@ -206,10 +218,6 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
     out.stream_options = { include_usage: true };
   }
   return out;
-}
-
-function numberOrZero(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 /** A Chat Completions answer as an Anthropic Messages object. */
