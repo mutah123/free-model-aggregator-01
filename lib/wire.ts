@@ -66,20 +66,23 @@ export function openAIError(message: string, type: string, code: string | null):
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
+  const parts: string[] = [];
+  for (const b of content) {
+    if (isRecord(b) && b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
+  }
+  return parts.join('\n');
 }
 
 /** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
 function partOf(block: Json): Json | null {
   if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
-  if (block.type === 'image' && isRecord(block.source)) {
-    const source = block.source;
-    if (source.type === 'base64' && typeof source.data === 'string') {
-      const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
-      return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
-    }
-    if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
+  if (block.type !== 'image' || !isRecord(block.source)) return null;
+  const source = block.source;
+  if (source.type === 'base64' && typeof source.data === 'string') {
+    const media = typeof source.media_type === 'string' ? source.media_type : 'image/png';
+    return { type: 'image_url', image_url: { url: `data:${media};base64,${source.data}` } };
   }
+  if (source.type === 'url' && typeof source.url === 'string') return { type: 'image_url', image_url: { url: source.url } };
   return null;
 }
 
